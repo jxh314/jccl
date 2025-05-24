@@ -16,11 +16,12 @@ namespace {
     const int bid = args->bid;
     const int nChannels = args->nChannels;
     ncclRing *ring = &ncclShmem.channel.ring;
-    int ringIx = ring->index;
+    int ringIx = ring->index;// This rank's index in the ring
+    // 指数据个数，而不是数据量 
     const ssize_t chunkSize = int(Proto::calcBytePerStep()/sizeof(T) * (Proto::Id == NCCL_PROTO_SIMPLE ? ALLREDUCE_CHUNKSTEPS : 1));
     const int nranks = ncclShmem.comm.nRanks;
     const ssize_t loopSize = nChannels*nranks*chunkSize;
-    const ssize_t size = args->count;
+    const ssize_t size = args->count;// 元素总数
 
     int minChunkSize;
     if (Proto::Id == NCCL_PROTO_LL)
@@ -30,25 +31,55 @@ namespace {
       minChunkSize = nthreads*(Proto::calcBytePerGrain()/sizeof(T))/2;
     }
 
-    Primitives<T, RedOp, FanSymmetric<1>, 1, Proto, 0> prims
-      (tid, nthreads, &ring->prev, &ring->next, args->sendbuff, args->recvbuff, args->redOpArg);
+    int dataRatio[2]={1,1};
+    dataRatio[0]=(int)args->dataRatio[0];
+    dataRatio[1]=(int)args->dataRatio[1];
+    int totalRatio=0;
+    for(int i=0;i<2;i++)  totalRatio+=dataRatio[i];
+    // const ssize_t loopSize = nChannels*nranks*chunkSize;// 每个循环迭代处理的元素总数
+    const ssize_t loopSize = nChannels==4? nChannels*nranks*chunkSize/4*totalRatio : nChannels*nranks*chunkSize; 
 
+    // Primitives<T, RedOp, FanSymmetric<1>, 1, Proto, 0> prims
+      // (tid, nthreads, &ring->prev, &ring->next, args->sendbuff, args->recvbuff, args->redOpArg);
+    // 根据bid及dataRatio 实例化通信原语，用于动态确定slicePerchunk
+    Primitives<T, RedOp, FanSymmetric<1>, 1, Proto, 0> prims
+      (tid, nthreads, &ring->prev, &ring->next, args->sendbuff, args->recvbuff, args->redOpArg,0,0,0,NULL,0,nChannels==4?dataRatio[bid%2]:0);
+    // if(Proto::Id == NCCL_PROTO_SIMPLE&& tid==0) printf("%d ,%d,%d \n",dataRatio[0],dataRatio[1],prims.SlicePerChunk);
+
+    // 主循环，遍历所有数据
     for (ssize_t gridOffset = 0; gridOffset < size; gridOffset += loopSize) {
       ssize_t realChunkSize;
+      ssize_t changedChunkSize[2];
       if (Proto::Id == NCCL_PROTO_SIMPLE) {
         realChunkSize = min(chunkSize, divUp(size-gridOffset, nChannels*nranks));
-        realChunkSize = roundUp(realChunkSize, (nthreads-WARP_SIZE)*sizeof(uint64_t)/sizeof(T));
-      }
-      else
-        realChunkSize = min(chunkSize, divUp(size-gridOffset, nChannels*nranks*minChunkSize)*minChunkSize);
-      realChunkSize = int(realChunkSize);
+        realChunkSize = roundUp(realChunkSize, (nthreads-WARP_SIZE)*sizeof(uint64_t)/sizeof(T));//WARP_SIZE 32
+        // 结果就是x向上取整到y的整数倍  work->nWarps=info->nThreads WARP_SIZE   （288-32）*2=256*2=512 
+        if(size-gridOffset< loopSize && nChannels==4){
+          ssize_t s=size -gridOffset;
+          changedChunkSize[0]=dataRatio[0]* divUp(s,(ssize_t)(totalRatio)* nranks* (nChannels/2));
+          changedChunkSize[1]=dataRatio[1]* divUp(s,(ssize_t)(totalRatio)* nranks* (nChannels/2));
+        } else{
+          changedChunkSize[0]=realChunkSize/2*dataRatio[0];
+          changedChunkSize[1]=realChunkSize/2*dataRatio[1];
+        }
+      }else realChunkSize = min(chunkSize, divUp(size-gridOffset, nChannels*nranks*minChunkSize)*minChunkSize);
+      realChunkSize = int(realChunkSize); //转为int ，原本为ssize-t
+      changedChunkSize[0]=int(changedChunkSize[0]);
+      changedChunkSize[1]=int(changedChunkSize[1]);
 
+      //计算数据偏移量的lambda函数,特定chunk和block的开始位置
       auto calcOffset = [&]__device__(int chunk)->ssize_t {
-        if (Proto::Id == NCCL_PROTO_SIMPLE)
-          return gridOffset + bid*nranks*realChunkSize + chunk*realChunkSize;
+        if (Proto::Id == NCCL_PROTO_SIMPLE){
+          if(nChannels==4)
+            return  gridOffset+ (bid%2)*nranks*changedChunkSize[0]+ (bid/2)*nranks*(changedChunkSize[0]+changedChunkSize[1])
+                    + chunk*changedChunkSize[bid%2];
+          else // 默认平均分配
+            return gridOffset + bid*nranks*realChunkSize + chunk*realChunkSize;
+        }
         else
           return gridOffset + (chunk*nChannels + bid)*realChunkSize;
       };
+      // 对rank取模的lambda函数
       auto modRanks = [&]__device__(int r)->int {
         return r - (r >= nranks ? nranks : 0);
       };
@@ -58,40 +89,47 @@ namespace {
       int chunk;
 
       // step 0: push data to next GPU
-      chunk = modRanks(ringIx + nranks-1);
+      chunk = modRanks(ringIx + nranks-1);//假设4卡，ring 0-1-2-3，则4张卡算出来的chunk分别为3，0，1，2
       offset = calcOffset(chunk);
-      nelem = min(realChunkSize, size-offset);
-      prims.send(offset, nelem);
+      nelem = min(nChannels==4? changedChunkSize[bid%2]:realChunkSize, size-offset); //要处理的数据个数
+      prims.send(offset, nelem);// 发送数据
 
       // k-2 steps: reduce and copy to next GPU
       for (int j=2; j<nranks; ++j) {
         chunk = modRanks(ringIx + nranks-j);
         offset = calcOffset(chunk);
-        nelem = min(realChunkSize, size-offset);
+        // nelem = min(realChunkSize, size-offset);
+        nelem = min(nChannels==4? changedChunkSize[bid%2]:realChunkSize, size-offset);
         prims.recvReduceSend(offset, nelem);
       }
 
-      // step k-1: reduce this buffer and data, which will produce the final
-      // result that we store in this data and push to the next GPU
+      // step k-1: reduce this buffer and data, which will produce the final result that we store in this data and push to the next GPU
       chunk = ringIx + 0;
       offset = calcOffset(chunk);
-      nelem = min(realChunkSize, size-offset);
+      // nelem = min(realChunkSize, size-offset);
+      nelem = min(nChannels==4? changedChunkSize[bid%2]:realChunkSize, size-offset);
       prims.directRecvReduceCopySend(offset, offset, nelem, /*postOp=*/true);
 
       // k-2 steps: copy to next GPU
       for (int j=1; j<nranks-1; ++j) {
         chunk = modRanks(ringIx + nranks-j);
         offset = calcOffset(chunk);
-        nelem = min(realChunkSize, size-offset);
+        // nelem = min(realChunkSize, size-offset);
+        nelem = min(nChannels==4? changedChunkSize[bid%2]:realChunkSize, size-offset);
         prims.directRecvCopySend(offset, nelem);
       }
 
       // Make final copy from buffer to dest.
       chunk = modRanks(ringIx + 1);
       offset = calcOffset(chunk);
-      nelem = min(realChunkSize, size-offset);
+      // nelem = min(realChunkSize, size-offset);
+      nelem = min(nChannels==4? changedChunkSize[bid%2]:realChunkSize, size-offset);
       prims.directRecv(offset, nelem);
     }
+  
+    // const int rank = ncclShmem.comm.rank;
+    // ssize_t s=size* sizeof(T) ;
+    // if(tid<=3) printf("rank %d bid %d tid/nthreads %d/%d : ring AllReduce size %lu \n",rank,bid,tid,nthreads,s);
   }
 
   template<typename T, typename RedOp, typename Proto>
@@ -173,11 +211,12 @@ namespace {
     const int bid = args->bid;
     const int nChannels = args->nChannels;
     ncclTree *tree = &ncclShmem.channel.tree;
+    //数据个数
     ssize_t chunkSize = int(
       Proto::Id != NCCL_PROTO_LL ? args->lastChunkSize
                                  : Proto::calcBytePerStep()/sizeof(T));
     const ssize_t minChunkSize = int(
-      Proto::Id == NCCL_PROTO_SIMPLE ? (nthreads - 2*WARP_SIZE)*8*(sizeof(uint64_t)/sizeof(T)) :
+      Proto::Id == NCCL_PROTO_SIMPLE ? (nthreads - 2*WARP_SIZE)*8*(sizeof(uint64_t)/sizeof(T)) ://（288-64）*8*2=3.5k
       Proto::Id == NCCL_PROTO_LL     ? nthreads*(Proto::calcBytePerGrain()/sizeof(T))
                    /* LL128 */       : nthreads*(Proto::calcBytePerGrain()/sizeof(T))/8);
     const ssize_t loopSize = int(nChannels*chunkSize);
@@ -196,13 +235,15 @@ namespace {
     if (loopSize > size)
       chunkSize = divUp((int)size, nChannels*int(minChunkSize))*int(minChunkSize);
 
-    if (tree->up == -1) {
+    if (tree->up == -1) {// 根节点
       // Reduce and broadcast. Max number of recv is 2, max number of send is 2
+      //实例化通信原语
       Primitives<T, RedOp, FanSymmetric<NCCL_MAX_TREE_ARITY_TOP>, /*Direct=*/1, Proto, 0>
         prims(tid, nthreads, tree->down, tree->down, args->sendbuff, args->recvbuff, args->redOpArg);
       for (ssize_t gridOffset = 0; gridOffset < size; gridOffset += loopSize) {
         ssize_t offset = gridOffset + bid*int(chunkSize);
         int nelem = min(chunkSize, size-offset);
+        //要处理的数据个数
         prims.directRecvReduceCopySend(offset, offset, nelem, /*doPost=*/true);
       }
     }
@@ -217,6 +258,7 @@ namespace {
        */
       Primitives<T, RedOp, FanAsymmetric<NCCL_MAX_TREE_ARITY, 1>, /*Direct=*/1, Proto, 0>
         prims(tid, nthreadsSplit, tree->down, &tree->up, args->sendbuff, args->recvbuff, args->redOpArg, 0*Proto::MaxGroupWidth);
+      //叶子结点
       if (tree->down[0] == -1) {
         for (ssize_t gridOffset = 0; gridOffset < size; gridOffset += loopSize) {
           ssize_t offset = gridOffset + bid*int(chunkSize);

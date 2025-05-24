@@ -188,20 +188,23 @@ static ncclResult_t addProxyOpIfNeeded(struct ncclComm* comm, struct ncclKernelP
 
 // Put coll workelem & proxyOp in plan assuming nWorkBudget permits, so please
 // ensure *nWorkBudget >= nBids upon entry.
+// 向计划中添加集体操作的工作元素（work element）及代理操作（proxy operation）
 static ncclResult_t addCollToPlan(
     struct ncclComm* comm, struct ncclKernelPlan* plan, int* nWorkBudget, int funcIndex,
     struct ncclWorkElem const* workElem, struct ncclProxyOp const* proxyOp,
-    int nCollChannels, int nBid, size_t bytes, ncclRegBufferType regBufType, void* regBufSend[], void* regBufRecv[]
-  ) {
+    int nCollChannels, int nBid, size_t bytes, ncclRegBufferType regBufType, void* regBufSend[], void* regBufRecv[],
+    struct ncclInfo info,int x,int y) {
   struct ncclKernelPlan::Channel *chans = plan->channels;
 
   // Choose the `nBid` least loaded channels to do the work. This ensures
   // all bids go to different channels in case they need to synchronize.
-  int least[/*nBid*/MAXCHANNELS];
+  // 选择 `nBid` 个负载最低的通道来执行任务。这样可以确保在需要同步的情况下，所有的（block id）都会分配到不同的通道上。
+  int least[/*nBid*/MAXCHANNELS]; // 初始化一个数组用于存储最少负载的通道索引
   least[0] = 0;
   int maxIndexInLeast = 0;
-  size_t maxBytesInLeast = chans[0].collBytes;
+  size_t maxBytesInLeast = chans[0].collBytes; // 记录当前最大负载
   // Initialize least[] such that the first nBid channels are accounted for.
+  // 预先填充least数组，前nBid个通道作为初始候选
   for (int b=1; b < nBid; b++) {
     least[b] = b;
     if (maxBytesInLeast < chans[b].collBytes) {
@@ -211,9 +214,14 @@ static ncclResult_t addCollToPlan(
   }
   // Sort in the rest of the channels. If a channel has less work than the max
   // member of least[], replace that member and compute the new max.
+  // 将剩余的通道进行排序。如果某个通道的工作量少于 least[] 中的最大成员，则替换该成员并重新计算新的最大值
+  // The optimal algorithm uses a max-heap, but for our small sizes I suspect the better
+  // asymptotic complexity would be swamped by the increased instruction complexity.
   for (int c=nBid; c < nCollChannels; c++) {
+    //对剩余通道进行排序，确保least数组始终指向负载最小的nBid个通道
     if (chans[c].collBytes < maxBytesInLeast) {
       least[maxIndexInLeast] = c;
+      //重新计算
       maxBytesInLeast = chans[least[0]].collBytes;
       maxIndexInLeast = 0;
       for (int b=1; b < nBid; b++) {
@@ -225,22 +233,45 @@ static ncclResult_t addCollToPlan(
     }
   }
 
+  // 计算新的操作计数，并按channel平均分配数据量
   uint64_t opCount = uint64_t(plan->collOpCount++)<<1 | 0;
-  bytes /= nBid;
+
+  //1.平均分配
+  size_t bytes_avergae= bytes/nBid; 
+
+  // 2.自定义分配
+  int dataRatio[2]={1,1};
+  dataRatio[0]=x;
+  dataRatio[1]=y;
+  int totalRatio=0;
+  for(int i=0;i<2;i++) totalRatio+=dataRatio[i];
+  bool changed=0;//若为all-reduce等3种 则修改，否则不改
+  if(info.coll==2||info.coll==3||info.coll==4) changed=1;
+  
   for (int bid=0; bid < nBid; bid++) {
     int c = least[bid];
-    chans[c].collBytes += bytes;
+    if(nBid==4 && changed)// ie 3:1 (3/8 1/8 3/8 1/8 )—— int（3）/4=0 ！！
+      chans[c].collBytes += bytes*((float)dataRatio[c%2]/totalRatio)/(nBid/2);
+    else
+      chans[c].collBytes += bytes_avergae;//平均分配到nchannels中数据量最小的nbids个channel里面——负载均衡
 
     // Add work elem
+    // 根据注册的缓冲区类型，选择合适的工作元素类型并附加到计划中
     *nWorkBudget += chans[c].nWork;
-    if (regBufType == NCCL_REGULAR_BUFFER) {
+    if (regBufType == NCCL_REGULAR_BUFFER) { 
+      //regular 普通类型
       appendWorkElemColl(comm, plan, c, funcIndex, workElem, bid);
-    } else if (regBufType == NCCL_IPC_REG_BUFFER) {
+      /* 
+        !!! 注意c为channel ID，bid为block id，二者未必相等  
+        内核处理根据的是bid!!!!! 
+       */
+    } else if (regBufType == NCCL_IPC_REG_BUFFER) { 
+      //IPC
       struct ncclChannel* channel = &comm->channels[c];
       struct ncclWorkElemReg workElemReg;
       workElemReg.elem = *workElem; // C++ struct assignment
-      workElemReg.elem.regUsed = 1;
-      for (int i=0; i < NCCL_MAX_DIRECT_ARITY; i++) {
+      workElemReg.elem.regUsed = 1; //标记使用了注册的缓冲区
+      for (int i=0; i < NCCL_MAX_DIRECT_ARITY; i++) { //遍历下层节点
         int peer = channel->collnetDirect.down[i];
         if (peer == -1) break;
         int j = comm->rankToLocalRank[peer]; // Get intra-node slot
@@ -272,10 +303,44 @@ static ncclResult_t addCollToPlan(
 
     // Add proxy task. Empty collectives do not make it to the proxy thread
     // since they don't imply synchronization for the user like p2p.
+    // 添加proxy操作
     if (proxyOp->nsteps != 0) {
       struct ncclProxyOp tmp = *proxyOp; // C++ struct assignment
-      tmp.channelId = c;
+      //设置proxy op 的channel ID
+      tmp.channelId = c; 
       tmp.opCount = opCount;
+      if(nBid==4 && changed){ //4条channel && all-reduce等
+        if(info.algorithm==1) {  
+          // ring- 默认每个chunk 2个slice，改为按照比例划分，3:1 -> 3个,1个 （0，3）（1，1）（2，3）（3，1）-loopsize 随之改变
+
+          // 1. 用单个channel 数据量计算nloops
+          tmp.chunkSize=tmp.chunkSize/2 /*slice size*/ *dataRatio[c%2];
+          tmp.chunkSteps=tmp.chunkSteps/2 /*slice steps*/ *dataRatio[c%2];
+          // int nLoops = (int)(DIVUP(info->nBytes, (((size_t)(info->nChannels))*info->nchunksPerLoop*chunkEffectiveSize)));
+          // int nsteps = info->nstepsPerLoop * nLoops * chunkSteps; 
+          // 每个循环处理nc*nchunks*chunksize->针对单个channel计算 nloops
+          int nLoops = (int)(DIVUP(chans[c].collBytes, (info.nchunksPerLoop*tmp.chunkSize)));
+          tmp.nsteps = info.nstepsPerLoop * nLoops * tmp.chunkSteps;//应该是一个循环内1个chunk内数据的的发送次数
+
+          // 2. 用总数据量计算nloops
+          // size_t loopsize= (nCollChannels/2) * info.nchunksPerLoop * (tmp.chunkSize/4) * totalRatio;
+          // tmp.chunkSize=tmp.chunkSize/2 /*sliceSize*/ *dataRatio[c%2];
+          // tmp.chunkSteps=tmp.chunkSteps/2 /*sliceSteps*/ *dataRatio[c%2];
+          // int nLoops = (int)(DIVUP(bytes,loopsize));
+          // tmp.nsteps = info.nstepsPerLoop * nLoops * tmp.chunkSteps;
+        }
+        else if(info.algorithm==0){
+          // tree 默认每个chunk 1个slice，改为按照比例划分，3:1 -> 3个,1个
+          tmp.chunkSize=tmp.chunkSize*dataRatio[c%2];
+          tmp.chunkSteps=tmp.chunkSteps*dataRatio[c%2];                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+          int nLoops = (int)(DIVUP(chans[c].collBytes, info.nchunksPerLoop*tmp.chunkSize));
+          tmp.nsteps = info.nstepsPerLoop * nLoops * tmp.chunkSteps;//应该是一个循环内1个chunk内数据的的发送次数
+        }
+      }
+      if (comm->rank == 0){
+        INFO(NCCL_COLL,"proxyNo. %lx (bid %d channel id %d ,bytes %zi) chunksteps %d chunksize %d nsteps %d comm %p",
+                      tmp.opCount, bid, c, chans[c].collBytes, tmp.chunkSteps, tmp.chunkSize ,tmp.nsteps, comm);
+      }
       NCCLCHECK(addProxyOpIfNeeded(comm, plan, &tmp));
     }
   }
@@ -467,68 +532,163 @@ fallback:
 static ncclResult_t getCollNetSupport(struct ncclInfo* info, int* collNetSupport);
 static ncclResult_t getAlgoInfo(struct ncclInfo* info, int collNetSupport, int nvlsSupport, int numPipeOps);
 
-static ncclResult_t scheduleCollTasksToPlan(
-    struct ncclComm* comm, struct ncclKernelPlan* plan, int* nWorkBudget
-  ) {
+static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKernelPlan* plan, int* nWorkBudget) 
+{
   struct ncclTasks* tasks = &comm->tasks;
-
+  //分别为是否支持集合通信，只有send/recv不是
   size_t bytePerChannel[/*collNetSupport*/2];
   if (comm->channelSize > 0) {
     // Set by user
     bytePerChannel[/*collNetSupport=*/0] = comm->channelSize;
     bytePerChannel[/*collNetSupport=*/1] = comm->channelSize;
   } else {
+    // 如果用户没有设置，动态调整通道大小以适应规模
     // Latency increases as scale increases
     // We would thus want to increase the chunk size to compensate for the lost efficiency
-    bytePerChannel[/*collNetSupport=*/0] = NCCL_AGG_CHANNEL_SIZE * std::min(16, comm->nRanks);
-    bytePerChannel[/*collNetSupport=*/1] = 256<<10; // Hand-tuned
+    // 随着规模增加，延迟也会增加，因此希望增加块大小以补偿效率损失
+    bytePerChannel[/*collNetSupport=*/0] = NCCL_AGG_CHANNEL_SIZE * std::min(16, comm->nRanks);//2MB*min（）
+    bytePerChannel[/*collNetSupport=*/1] = 256<<10; // Hand-tuned-256KB
   }
 
   for (int collNetSupport=0; collNetSupport < 2; collNetSupport++) {
+    //collBytesTotal  感觉是当前任务及其以前的总data？？？打印
     while (tasks->collBytesTotal < bytePerChannel[collNetSupport]*comm->nChannels &&
            bytePerChannel[collNetSupport] > NCCL_MIN_CHANNEL_SIZE) {
       // Reduce per-channel size so we utilize all channels.
+      // 减小 每channel数据量
       bytePerChannel[collNetSupport] /= 2;
     }
   }
 
+  //---------------------------自定义分配-------------------------------
+  const char *dataRatioStr = ncclGetEnv("NCCL_CHANNEL_DATA_RATIO");
+  int dataRatio[2]={1,1};
+  int numParsed;
+  numParsed = sscanf(dataRatioStr, "%d,%d", &dataRatio[0], &dataRatio[1]); // 使用 sscanf 解析字符串
+  if(comm->localRank==0){
+    if (numParsed != 2) INFO(NCCL_ENV, "NCCL_CHANNEL_DATA_RATIO parse falied  %s",dataRatioStr);
+    else INFO(NCCL_ENV, "NCCL_CHANNEL_DATA_RATIO set by environment to %d : %d",dataRatio[0],dataRatio[1]);
+  }
+  
+  // cudaDeviceProp prop;
+  // cudaGetDeviceProperties(&prop, 0);
+  // double clockRateKHz = prop.clockRate; // 转换为KHz
+  // // printf("clock rate %.2f khz\n",clockRateKHz);
+  // // 分配主机内存，用于存储每个block的执行时间
+  // float h_blockBws[NCCL_MAX_NCHANNELS]={1};
+  // float h_blockTimes[NCCL_MAX_NCHANNELS]={0};
+  // // cudaDeviceSynchronize(); 同步的话会导致带宽下降
+  // // 将设备内存中的执行时间拷贝到主机
+  // cudaMemcpyFromSymbol(h_blockBws, blocksAlgbw, NCCL_MAX_NCHANNELS * sizeof(float));
+  // cudaMemcpyFromSymbol(h_blockTimes, blocksTime, NCCL_MAX_NCHANNELS * sizeof(float));
+  // // 计算并输出每个block的执行时间-展示 nc-different 的algbw  
+  // for (int i = 0; i <2/*comm->nChannels*/; i++) {
+  //   INFO(NCCL_COLL,"clock %llu ns, channel %d algbw %.2f GB/s time %.2f ms",
+  //               clockNano(),i,h_blockBws[i],h_blockTimes[i]);
+  // }
+  
+
+  //-----------------------------------------network------------------------------------------------------
+  /*
+  int nNets=comm->topo->nodes[NET].count;
+  if(nNets>0){// 使用网卡
+    // 1. 获取net 的实时 bw
+    for(int i=0;i<nNets;i++){
+      get_bw(comm->nets[i].name,comm->nets[i].bw);
+      // rx ,tx 中较大的
+      float bw_tmp=std::max(comm->nets[i].bw[0],comm->nets[i].bw[1]);
+      //剩余bw= 当前网卡的maxbw - 实际bw（目前用topo->maxBw代替，gpu到任意网卡的最大带宽）
+      float t=std::min(comm->topo->maxBw,comm->nets[i].maxBw);// 暂时用maxbw 和网卡的最大带宽替代
+      comm->nets[i].bw_left= t*1.0E3- bw_tmp;
+      while(comm->nets[i].bw_left<0) {
+         comm->nets[i].bw_left+=100;
+      }
+      comm->nets[i].bw_avail=comm->nets[i].bw_left;// MB/s
+      // 可用bw= nccl占用+剩余bw
+      for(int cid=0;cid<NCCL_MAX_NCHANNELS;cid++){
+        if(comm->nets[i].channel[cid]!=0)
+          comm->nets[i].bw_avail+=h_blockBws[cid]*1000; // MB/s
+      }
+      if(comm->nets[i].bw_avail>t) comm->nets[i].bw_avail=t*1000;
+        
+      if(comm->localRank ==0)
+        INFO(NCCL_INIT, "rank %d nNets:%d name:%s maxbw:%f bw:(%.2f/%.2f) bw_left %.2f bw_avail %.2f MB/s",
+             comm->rank,nNets,comm->nets[i].name,comm->nets[i].maxBw, comm->nets[i].bw[0], comm->nets[i].bw[1],comm->nets[i].bw_left,comm->nets[i].bw_avail);
+    }
+    // 用到多个网卡 // 获取比例
+    if(nNets>1 && comm->nChannels==4 ) get_ratio(comm->nets[0].bw_avail, comm->nets[1].bw_avail, dataRatio[0], dataRatio[1]);
+    
+    // all-gather 保证多节点之间比例一致
+    // 直接all-gather即可， 各个rank就一起考虑到了，不需要区分多节点之间和单机多卡
+    #define MAXRANKS 256
+    int a[MAXRANKS* MAXCHANNELS/2]={0};
+    int nc_different=comm->nChannels/2;
+    for(int i=0;i<nc_different;i++){
+      a[comm->rank*nc_different+i]=dataRatio[i];//每个rank保存n条channel的比例
+    }
+    if(comm->nChannels==4){
+      INFO(NCCL_INIT, "rank %d nc %d RatioArray set to (%d,%d)",
+          comm->rank,nc_different,a[comm->rank*nc_different],a[comm->rank*nc_different+1]);
+    }
+    bootstrapAllGather(comm->bootstrap,a,2*sizeof(int));
+
+    // 输出收集结果
+    // for(int i=0;i<comm->nRanks*comm->nChannels;i++){
+    if(comm->nChannels==4){
+      INFO(NCCL_INIT,"AllGather finished rank %d (%d,%d) (%d,%d)",comm->rank,a[0],a[1],a[2],a[3]);
+      get_consistent_ratio(a,comm->nRanks,nc_different,dataRatio[0],dataRatio[1]);
+      if(comm->localRank==0){
+        INFO(NCCL_INIT, "different channels %d data ratio set to %d : %d",nc_different,dataRatio[0],dataRatio[1]);
+      }
+    }
+  }
+  */
+
   while (tasks->nTasksColl != 0) {
+    //首个集合通信任务,获取队列head但不删除
     struct ncclTaskColl* head = ncclIntruQueueHead(&tasks->collQueue);
+    // 初始化聚合信息结构体
     struct ncclInfo aggInfo = {};
     aggInfo.comm = comm;
-    aggInfo.coll = head->func;
+    aggInfo.coll = head->func; // 操作类型
     aggInfo.datatype = head->datatype;
-    aggInfo.opFull = head->op;
-    aggInfo.op = (ncclRedOp_t)(int)head->op.op;
-    aggInfo.count = head->count;
+    aggInfo.opFull = head->op;// 完整操作信息
+    aggInfo.op = (ncclRedOp_t)(int)head->op.op;// 归约操作类型
+    aggInfo.count = head->count;// 元素计数
     int nAggChannels = 0;
     int nAggOps = 1;
-    struct ncclTaskColl* aggEnd = head->next;
+    struct ncclTaskColl* aggEnd = head->next;//下一个任务，emm 那每一个epoch的执行也需要时间，怎么就能提前获取所有任务呢？
+    // 感觉是框架测做的，group start 和end 之间夹了多少个任务
     int nvlsSupport = comm->nvlsSupport && ncclNvlsSupported(aggInfo.opFull.op, aggInfo.datatype);
     int collNetSupport = 0;
-    NCCLCHECK(getCollNetSupport(&aggInfo, &collNetSupport));
+    NCCLCHECK(getCollNetSupport(&aggInfo, &collNetSupport));//若支持集合通信，collNetSupport被置1
 
     // Find a range of ops that can be aggregated together.
+    // 找到一系列相同类型op 并聚合在一起
     while (aggEnd != nullptr &&
            aggEnd->func == aggInfo.coll &&
            aggEnd->datatype == aggInfo.datatype &&
            aggEnd->op.op == aggInfo.opFull.op) {
-      aggInfo.count += aggEnd->count;
-      int nc = DIVUP(aggEnd->count*ncclTypeSize(aggInfo.datatype), bytePerChannel[collNetSupport]);
-      nc = std::max(1, std::min(nc, comm->nChannels));
-      nAggChannels += nc;
-      nAggOps++;
-      aggEnd = aggEnd->next;
+      aggInfo.count += aggEnd->count;//聚合count 累加
+      int nc = DIVUP(aggEnd->count*ncclTypeSize(aggInfo.datatype), bytePerChannel[collNetSupport]); //DIVUP(x, y)= (x+y-1)/y 向上取整
+      nc = std::max(1, std::min(nc, comm->nChannels));// 设置channel数量
+      nAggChannels += nc;//各个相同操作的任务nc累加
+      nAggOps++;// 聚合操作计数
+      aggEnd = aggEnd->next;//next
     }
 
-    if (nAggOps > 1) {
-      NCCLCHECK(ncclInfoSetDerived(&aggInfo, comm->nRanks));
-      aggInfo.nChannels = std::min(comm->nChannels, nAggChannels);
-      int opPerChannel = DIVUP(nAggChannels, aggInfo.nChannels);
-      NCCLCHECK(getAlgoInfo(&aggInfo, collNetSupport, nvlsSupport, opPerChannel));
+    if (nAggOps > 1) {// 如果有多个操作被聚合
+        NCCLCHECK(ncclInfoSetDerived(&aggInfo, comm->nRanks));//对特定操作做特殊处理
+        aggInfo.nChannels = std::min(comm->nChannels, nAggChannels);// 设置聚合操作使用的通道数
+        int opPerChannel = DIVUP(nAggChannels, aggInfo.nChannels);// 计算每个通道上 操作的数量
+        // 获取适合聚合操作的算法和协议信息-tuning
+        NCCLCHECK(getAlgoInfo(&aggInfo, collNetSupport, nvlsSupport, opPerChannel));
     }
 
     while (head != aggEnd) {
+      //遍历相同操作的任务。若共10个。前8相同，此时agg end=8，head=0
+      // 若前两个就不相同，安排完第一个后，head=aggend，此循环退出，ntask coll -1，
+      // 进入line 495 ：while (tasks->nTasksColl != 0) 继续按照相同逻辑安排下一个任务
       struct ncclInfo info = {};
       info.comm = comm;
       info.coll = head->func;
@@ -543,10 +703,14 @@ static ncclResult_t scheduleCollTasksToPlan(
       info.sliceSteps = head->sliceSteps;
       NCCLCHECK(ncclInfoSetDerived(&info, comm->nRanks));
       if (nAggOps > 1) {
+        // 此处仅设置了聚合操作任务的nc，若第二个任务就不同，line 614:algo info里才计算nc
+        // soga, 聚合操作和单个操作的nc计算仍有差别，algo info 里的还涉及线程和thereshold
         int maxChannels = aggInfo.algorithm == NCCL_ALGO_NVLS || aggInfo.algorithm == NCCL_ALGO_NVLS_TREE ? comm->nvlsChannels : comm->nChannels;
         info.nChannels = DIVUP(info.nBytes, bytePerChannel[collNetSupport]);
         info.nChannels = std::max(1, std::min(info.nChannels, maxChannels));
-        info.algorithm = aggInfo.algorithm;
+        // so关于agginfo的以上计算只是为了计算op_per channel，然后获取算法，协议等？
+        // 而channel数量还是根据head来的 ，即每一个task
+        info.algorithm = aggInfo.algorithm;// 将聚合操作中计算出的算法、协议和线程数应用到当前任务
         info.protocol = aggInfo.protocol;
         info.nThreads = aggInfo.nThreads;
       }
@@ -556,30 +720,46 @@ static ncclResult_t scheduleCollTasksToPlan(
       struct ncclProxyOp proxyOp = {};
       // Check whether algo and proto have been preset (as in aggregation case)
       // If so, skip the calculation
+      // 检查是否已经设置了algo & protocol，通过检查nc和nt
       if (info.nChannels <= 0 || info.nThreads <= 0) {
+        //若是单个操作则尚未设置，比如第二个任务就不同
         NCCLCHECK(getAlgoInfo(&info, collNetSupport, nvlsSupport, 1));
       }
 
       if (*nWorkBudget < info.nChannels) return ncclSuccess; // Ensure room for addCollToPlan()
 
       /* if possible, start registration  */
+      /* 初始化注册缓冲区类型为常规类型 */
       ncclRegBufferType regBufType = NCCL_REGULAR_BUFFER;
+      /* 分配空间以保存发送和接收缓冲区指针，针对每个local rank */
       void* regBufSend[NCCL_MAX_LOCAL_RANKS];
       void* regBufRecv[NCCL_MAX_LOCAL_RANKS];
 
       registerIntraNodeBuffers(comm, plan, &info, regBufSend, regBufRecv, &regBufType);
 
-      NCCLCHECK(computeColl(&info, &workFuncIndex, &workElem, &proxyOp));
+      NCCLCHECK(computeColl(&info, &workFuncIndex, &workElem, &proxyOp/*output*/));
+      for(int i=0;i<2;i++){
+        workElem.dataRatio[i]=dataRatio[i];//数据比
+      }
 
       int maxChannels = info.algorithm == NCCL_ALGO_NVLS || aggInfo.algorithm == NCCL_ALGO_NVLS_TREE ? comm->nvlsChannels : comm->nChannels;
       NCCLCHECK(addCollToPlan(comm, plan, nWorkBudget, workFuncIndex, &workElem, &proxyOp,
-        maxChannels, info.nChannels, info.nBytes, regBufType, regBufSend, regBufRecv));
-      tasks->nTasksColl -= 1;
-      tasks->collBytesTotal -= info.nBytes;
-      ncclIntruQueueDequeue(&tasks->collQueue);
-      head = ncclIntruQueueHead(&tasks->collQueue);
+                              maxChannels, info.nChannels, info.nBytes, regBufType, regBufSend, regBufRecv
+                              info, dataRatio[0], dataRatio[1]));
+      
+      if(comm->rank==0) 
+        INFO(NCCL_COLL, "nc: %d nt: %d nbytes: %lu coll: %d ->(algo %d protocol %d) bytePerChannel: %lu nWorkBudget: %d ntaskscoll: %d collBytesTotal: %lu workFuncIndex: %d",
+                        info.nChannels, info.nThreads, info.nBytes, info.coll, info.algorithm, info.protocol,
+                        bytePerChannel[1], *nWorkBudget,tasks->nTasksColl,tasks->collBytesTotal,workFuncIndex);
 
+      tasks->nTasksColl -= 1;//任务数-1
+      tasks->collBytesTotal -= info.nBytes; //更新数据量
+      ncclIntruQueueDequeue(&tasks->collQueue);//移除队列头元素
+      head = ncclIntruQueueHead(&tasks->collQueue);//next task-返回新的head
+
+      /* 根据当前任务信息更新计划的线程配置，确保使用最合适的线程数 */
       plan->threadPerBlock = std::max(plan->threadPerBlock, info.nThreads);
+      /* 如果当前计划的内核尚未特定化，根据计算出的工作函数索引设定特定的内核函数 */
       if (!plan->kernelSpecialized) {
         plan->kernelFn = ncclDevKernelForFunc[workFuncIndex];
         plan->kernelSpecialized = ncclDevKernelForFuncIsSpecialized[workFuncIndex];
@@ -1033,12 +1213,12 @@ NCCL_PARAM(MemSyncDomain, "MEM_SYNC_DOMAIN", cudaLaunchMemSyncDomainRemote);
 
 ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   struct ncclTasks* tasks = &comm->tasks;
-  void *fn = plan->kernelFn;
-  cudaStream_t launchStream = tasks->streams->stream;
-  dim3 grid = {(unsigned)plan->channelCount, 1, 1};
-  dim3 block = {(unsigned)plan->threadPerBlock, 1, 1};
-  size_t smem = ncclShmemDynamicSize(comm->cudaArch);
-  void *args[3] = {&comm->devComm, &plan->channelMask, &plan->workHead};
+  void *fn = plan->kernelFn;// 内核函数指针
+  cudaStream_t launchStream = tasks->streams->stream;// 启动内核的 CUDA 流
+  dim3 grid = {(unsigned)plan->channelCount, 1, 1};// 网格维度，通常是channel数量
+  dim3 block = {(unsigned)plan->threadPerBlock, 1, 1};// 块维度，通常是每个block中的线程数
+  size_t smem = ncclShmemDynamicSize(comm->cudaArch); // 动态共享内存的大小
+  void *args[3] = {&comm->devComm, &plan->channelMask, &plan->workHead};//内核参数
 
   #if CUDART_VERSION >= 11080
   int driverVersion;
@@ -1312,9 +1492,11 @@ static ncclResult_t getLoopInfo(struct ncclInfo* info) {
 
 static ncclResult_t computeColl(struct ncclInfo* info /* input */, int* workFuncIndex, struct ncclWorkElem* work, struct ncclProxyOp* proxyOp /* output */) {
   // Set nstepsPerLoop and nchunksPerLoop
+  // 设置每每轮迭代次数和分块数
   NCCLCHECK(getPatternInfo(info));
   NCCLCHECK(getLoopInfo(info));
 
+  //填充ncclWorkElem结构体，包含通信操作的基础信息
   work->sendbuff = info->sendbuff;
   work->recvbuff = info->recvbuff;
   work->root = info->root;
@@ -1323,14 +1505,20 @@ static ncclResult_t computeColl(struct ncclInfo* info /* input */, int* workFunc
   work->nWarps = info->nThreads / WARP_SIZE;
   work->redOpArg = info->opFull.scalarArg;
   work->redOpArgIsPtr = info->opFull.scalarArgIsPtr;
+  // 根据操作类型、数据类型等计算函数ID
   *workFuncIndex = ncclDevFuncId(info->coll, info->opFull.op, info->datatype, info->algorithm, info->protocol);
 
   int stepSize   = info->comm->buffSizes[info->protocol]/NCCL_STEPS;
   int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
   int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
   int chunkSize  = stepSize*chunkSteps;
+  // NCCL_STEPS=8
+  // ALLREDUCE_CHUNKSTEPS=(NCCL_STEPS/2)=4
+  // ALLREDUCE_SLICESTEPS=(NCCL_STEPS/4)=2
+  // buffSizes/8 *4=buffSizes/2
 
   // Compute lastChunkSize
+  // 根据不同的算法和协议优化lastChunkSize，以提升通信效率
   if (info->algorithm == NCCL_ALGO_TREE && info->protocol == NCCL_PROTO_SIMPLE) {
     if (info->pattern == ncclPatternTreeUpDown) {
       // Optimize chunkSize / nSteps
@@ -1338,7 +1526,7 @@ static ncclResult_t computeColl(struct ncclInfo* info /* input */, int* workFunc
       while (info->nBytes / (info->nChannels*chunkSize) < info->comm->channels[0].tree.depth*4 && chunkSize > 65536) chunkSize /= 2;
       while (info->nBytes / (info->nChannels*chunkSize) < info->comm->channels[0].tree.depth && chunkSize > 32768) chunkSize /= 2;
     }
-    // Use lastChunkSize as chunkSize
+    // Use lastChunkSize as chunkSize-指数据个数
     work->lastChunkSize = chunkSize / ncclTypeSize(info->datatype);
   } else if (info->algorithm == NCCL_ALGO_COLLNET_DIRECT) {
     // Optimize chunkSize / nSteps
@@ -1408,9 +1596,16 @@ static ncclResult_t computeColl(struct ncclInfo* info /* input */, int* workFunc
   proxyOp->pattern = info->pattern;
   proxyOp->root = info->root;
   // This is used by P2P to reduce the receive buffer size. We don't use it in collectives
-  // because some protocols need to transmit more than the total size, plus they sometimes
-  // round up
+  // because some protocols need to transmit more than the total size, plus they sometimes round up
+  // 此设置用于点对点(P2P)通信以减小接收缓冲区的大小。在集体通信中我们不采用此方式，
+  // 因为某些通信协议需要传输的数据量超过总大小，而且它们有时会进行向上取整处理。
   proxyOp->nbytes = stepSize*proxyOp->sliceSteps;
+
+  if (info->comm->rank == 0)
+  INFO(NCCL_COLL,"coll %d slicesteps %d nstepsPloop %d nchunksPloop %d nbytes %zi -> nloops %d loopsize %lu nsteps %d chunksize %d comm %p",
+                  info->coll,sliceSteps, info->nstepsPerLoop, info->nchunksPerLoop, info->nBytes, 
+                  nLoops,(((size_t)(info->nChannels))*info->nchunksPerLoop*chunkEffectiveSize), proxyOp->nsteps, chunkSize, info->comm);
+  
 
   TRACE(NCCL_COLL,"opCount %lx slicesteps %d spl %d cpl %d nbytes %zi -> protocol %d nchannels %d nthreads %d, nloops %d nsteps %d chunksize %d comm %p",
       proxyOp->opCount, sliceSteps, info->nstepsPerLoop, info->nchunksPerLoop, info->nBytes, info->protocol, info->nChannels, info->nThreads,

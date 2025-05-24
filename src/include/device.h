@@ -137,11 +137,11 @@ struct ncclRing {
 // The root of each tree only has one node down (+1 intra-node).
 #define NCCL_MAX_TREE_ARITY_TOP 2
 // Nodes inside the binary tree can have to two nodes down (+1 intra-node).
-#define NCCL_MAX_TREE_ARITY 3
+#define NCCL_MAX_TREE_ARITY 3 //每个节点可以有两个子节点（+1个内部节点）
 struct ncclTree {
   int depth;
-  int up;
-  int down[NCCL_MAX_TREE_ARITY];
+  int up; //父节点的索引
+  int down[NCCL_MAX_TREE_ARITY]; //指向该节点的子节点的索引
 };
 
 #define NCCL_MAX_DIRECT_ARITY 7
@@ -181,6 +181,9 @@ struct ncclDevComm;
 /* ncclWork is to be a power of two, currently 8x64 bytes, */
 /* to make sure reads to host from the CUDA kernel are aligned. */
 /* Make sure to adjust padding at the end of ncclWorkElem. */
+/* ncclWork 应该是2的幂次方，目前是 8x64 字节， 
+  这是为了确保从 CUDA 内核读取到主机的数据是对齐的。 
+  确保调整 ncclWorkElem 结尾处的填充。 */
 #define NCCL_WORK_SIZE 512
 
 enum ncclWorkType : uint8_t {
@@ -215,6 +218,7 @@ struct ncclWorkElem {
   };
   uint8_t nWarps;
   uint8_t direct;
+  uint8_t dataRatio[2];// 8B对齐
 
   const void * sendbuff;
   void * recvbuff;
