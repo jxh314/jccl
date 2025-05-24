@@ -20,7 +20,7 @@ namespace {
     // 指数据个数，而不是数据量 
     const ssize_t chunkSize = int(Proto::calcBytePerStep()/sizeof(T) * (Proto::Id == NCCL_PROTO_SIMPLE ? ALLREDUCE_CHUNKSTEPS : 1));
     const int nranks = ncclShmem.comm.nRanks;
-    const ssize_t loopSize = nChannels*nranks*chunkSize;
+    // const ssize_t loopSize = nChannels*nranks*chunkSize;
     const ssize_t size = args->count;// 元素总数
 
     int minChunkSize;

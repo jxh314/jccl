@@ -8,7 +8,7 @@
 
 template<typename T, typename RedOp, typename Fan, int Direct,
          int SlicePerChunk_1, int StepPerSlice, int Unroll, int P2p, int MultimemSrcs, int MultimemDsts>
-class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts>, P2p> 
+class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk_1, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts>, P2p> 
 {
   static constexpr int MaxRecv = Fan::MaxRecv, MaxSend = Fan::MaxSend;
   static constexpr int Input=0, Output=1;
@@ -472,7 +472,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice,
       int stepSize_=0, int spc=0):
     tid(tid), nthreads(nthreads), tidInBlock(threadIdx.x), group(group),
     stepSize(stepSize_ == 0 ? ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS/sizeof(T) : stepSize_),
-    SlicePerChunk(spc==0? SlicePerChunk_1 : spc), {
+    SlicePerChunk(spc==0? SlicePerChunk_1 : spc){
 
     // For send operations, we need an extra warp to overlap the threadfence and the copy
     this->nworkers = nthreads - (MaxSend > 0 && nthreads-WARP_SIZE >= 64 ? WARP_SIZE : 0);
