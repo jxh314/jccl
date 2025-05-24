@@ -744,7 +744,7 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
 
       int maxChannels = info.algorithm == NCCL_ALGO_NVLS || aggInfo.algorithm == NCCL_ALGO_NVLS_TREE ? comm->nvlsChannels : comm->nChannels;
       NCCLCHECK(addCollToPlan(comm, plan, nWorkBudget, workFuncIndex, &workElem, &proxyOp,
-                              maxChannels, info.nChannels, info.nBytes, regBufType, regBufSend, regBufRecv
+                              maxChannels, info.nChannels, info.nBytes, regBufType, regBufSend, regBufRecv,
                               info, dataRatio[0], dataRatio[1]));
       
       if(comm->rank==0) 
