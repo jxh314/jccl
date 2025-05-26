@@ -865,7 +865,7 @@ static ncclResult_t addP2pToPlan(
     if(comm->rank==0){
       INFO(NCCL_TUNING, "%s: %ld Bytes -> Algo %s proto %s channel{Lo..Hi}={%d..%d}",
         dir?"Send":"Recv", bytes[dir], ncclAlgoToString(-1),
-        protocol[dir]=="LL"?"LL":"SIMPLE", 0, nChannels[dir]-1);
+        protocol[dir]==NCCL_PROTO_LL ?"LL":"SIMPLE", 0, nChannels[dir]-1);
     }
   }
 
