@@ -701,9 +701,9 @@ static ncclResult_t scheduleCollTasksToPlan(
     }
 
     if (comm->rank == 0) {
-      INFO(NCCL_TUNING, "%s: %ld Bytes -> Algo %s proto %s channel{Lo..Hi}={%d..%d}",
+      INFO(NCCL_TUNING, "%s: %ld Bytes -> Algo %s proto %s channel{Lo..Hi}={%d..%d} comm %p",
         ncclFuncToString(task->func), task->count * ncclTypeSize(task->datatype), ncclAlgoToString(task->algorithm),
-        ncclProtoToString(task->protocol), devWork->channelLo, devWork->channelHi);
+        ncclProtoToString(task->protocol), devWork->channelLo, devWork->channelHi, comm);
 
       if (task->isCollnet) {
         TRACE(NCCL_COLL, "Collective %s(%s, %s, %s, %s) count=%ld devFuncId=%d channel{Lo..Hi}={%d..%d} count=%ld chunkCount=%d",
@@ -861,11 +861,13 @@ static ncclResult_t addP2pToPlan(
       }
     }
 
-    // add p2p tuning info
-    if(comm->rank==0){
-      INFO(NCCL_TUNING, "%s: %ld Bytes -> Algo %s proto %s channel{Lo..Hi}={%d..%d}",
-        dir?"Send":"Recv", bytes[dir], ncclAlgoToString(-1),
-        protocol[dir]==NCCL_PROTO_LL ?"LL":"SIMPLE", 0, nChannels[dir]-1);
+    // p2p tuning info
+    if (comm->rank == 0) { 
+      if(bytes[dir] >=0) {
+        INFO(NCCL_TUNING, "%s: %ld Bytes -> Algo %s proto %s channel{Lo..Hi}={%d..%d} comm %p",
+            dir? "Send":"Recv",  bytes[dir], ncclAlgoToString(-1), 
+            (protocol[dir] == NCCL_PROTO_LL ? "LL" : "SIMPLE"), 0, nChannels[dir]-1, comm);
+      }
     }
   }
 

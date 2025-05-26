@@ -321,7 +321,7 @@ static ncclResult_t connectNvls(struct ncclComm* comm, int* nvlsHeads, int nHead
 // Legacy naming
 NCCL_PARAM(MinNrings, "MIN_NRINGS", -2);
 NCCL_PARAM(MaxNrings, "MAX_NRINGS", -2);
-// New naming
+// New naming- 从env 获取
 NCCL_PARAM(MinNchannels, "MIN_NCHANNELS", -2);
 NCCL_PARAM(MaxNchannels, "MAX_NCHANNELS", -2);
 
@@ -351,7 +351,8 @@ int ncclMaxNchannels() {
   }
   return maxNchannels;
 }
-
+ 
+// Copy channels from start to end, i.e. [start, end]=[2,4] will copy channels 2 and 3 from (0 and 1)
 static int copyChannels(struct ncclComm* comm, int start, int end, int* ringPrev, int* ringNext) {
   int nranks = comm->nRanks;
   int c;
@@ -480,7 +481,9 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
     nChannels = comm->nChannels = std::min(std::min(std::min(ncclMaxNchannels(), nChannels), comm->config.maxCTAs), comm->sharedRes->tpNChannels);
     nChannels = comm->nChannels = copyChannels(comm, nChannels, std::min(std::max(ncclMinNchannels(), comm->config.minCTAs), comm->sharedRes->tpNChannels), ringPrev, ringNext);
   } else {
+    // 确定上界——3者的最小值
     nChannels = comm->nChannels = std::min(std::min(ncclMaxNchannels(), nChannels), comm->config.maxCTAs);
+    // 确定最终值，config.minCTAs 代表p2p nchannels
     nChannels = comm->nChannels = copyChannels(comm, nChannels, std::max(ncclMinNchannels(), comm->config.minCTAs), ringPrev, ringNext);
   }
 
