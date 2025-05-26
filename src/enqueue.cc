@@ -860,6 +860,13 @@ static ncclResult_t addP2pToPlan(
         partSize = divUp(bytes[dir], nChannels[dir]);
       }
     }
+
+    // add p2p tuning info
+    if(comm->rank==0){
+      INFO(NCCL_TUNING, "%s: %ld Bytes -> Algo %s proto %s channel{Lo..Hi}={%d..%d}",
+        dir?"Send":"Recv", bytes[dir], ncclAlgoToString(-1),
+        protocol[dir]=="LL"?"LL":"SIMPLE", 0, nChannels[dir]-1);
+    }
   }
 
   struct ncclWorkList* workNode = ncclMemoryStackAllocInlineArray<ncclWorkList, ncclDevWorkP2p>(&comm->memScoped, 1);
