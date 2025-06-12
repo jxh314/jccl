@@ -779,9 +779,7 @@ static size_t calcP2pChunkSize(size_t totalSize, int minChannels, int maxChannel
   return alignUp(size, minSize);
 }
 
-static ncclResult_t scheduleP2pTasksToPlan(
-    struct ncclComm* comm, struct ncclKernelPlan* plan, int* nWorkBudget
-  ) {
+static ncclResult_t scheduleP2pTasksToPlan(struct ncclComm* comm, struct ncclKernelPlan* plan, int* nWorkBudget) {
   struct ncclTasks* tasks = &comm->tasks;
   int nRanks = comm->nRanks;
   struct ncclTasks::Peer* peers = tasks->peers;

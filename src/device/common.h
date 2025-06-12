@@ -173,7 +173,11 @@ __device__ void ncclKernelMain(struct ncclDevComm* comm, uint64_t channelMask, s
     }
     if (bytes) copyToShmem16(tid%WARP_SIZE, dst, src, bytes);
   }
-  __syncthreads(); // publish ncclShmem
+  __syncthreads(); // publish ncclShmem 所有线程同步，确保数据已经加载到共享内存中
+
+  //  计时
+  unsigned long long start, end;
+  if (threadIdx.x == 0)  start = clock();
 
   while (true) {
     // Notify host that all fifo reads are complete.
@@ -197,15 +201,38 @@ __device__ void ncclKernelMain(struct ncclDevComm* comm, uint64_t channelMask, s
 
     int workIxNext = ncclShmem.work.header.workNext;
     __syncthreads();
-    if (ncclShmem.work.header.isLast) break;
+    if (ncclShmem.work.header.isLast) break;// 结束点1
 
     copyToShmem16(tid, &ncclShmem.work, workHead + workIxNext, sizeof(ncclWork));
 
     { // Check whether the last operation was aborted and make sure all threads exit
       int aborted = tid == 0 ? *comm->abortFlag : 0;
       if (barrierReduceAny(aborted)) // publish ncclShmem.work
-        break;
+        break;// 结束点2
     }
+  }
+
+  // 结束计时
+  if (threadIdx.x == 0) {
+      end = clock();
+      float result = (end - start);
+      // float time=result/(double)CLOCKS_PER_SEC;
+      float time=result / 2520000; //ms
+      uint8_t *ratio= workHead->elems[0].dataRatio;
+      int totalRatio= ratio[0]+ ratio[1];
+      // 默认data type 为 float32 =4B，暂未结合实际数据类型
+      float totalBw= workHead->elems[0].count/ time *4 / 1.0E9*1000; 
+      // 2条channel 数据分配比例保存在elem中
+      if(totalRatio> 0){
+        blocksAlgbw[channelId]= totalBw/ totalRatio* ratio[channelId%2];// 每条channel处理相应比例的数据量
+      }
+      blocksTime[channelId]= time;
+
+      if(comm->rank==0){
+         printf("rank %d blocks[%d] algbw %.3f GB/s, tid %d time %.2f totalCount %lu totalBw %.3f %d:(%d,%d)\n",
+              comm->rank, channelId, blocksAlgbw[channelId], tid, time, workHead->elems[0].count, 
+              totalBw, totalRatio, ratio[0], ratio[1]);
+      }        
   }
 }
 

@@ -8,6 +8,10 @@
 #define NCCL_COLLECTIVES_H_
 
 #include "nccl.h"
+#define NCCL_MAX_NCHANNELS 32
+// 定义设备端全局变量，用于存储每个block的带宽
+extern __device__ float blocksAlgbw[NCCL_MAX_NCHANNELS];
+extern __device__ float blocksTime[NCCL_MAX_NCHANNELS];
 
 // CHUNKSIZE must be a multiple of SLICESIZE
 #define ALLREDUCE_SLICESTEPS (NCCL_STEPS/4)

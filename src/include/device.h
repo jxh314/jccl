@@ -218,7 +218,7 @@ struct ncclWorkElem {
   };
   uint8_t nWarps;
   uint8_t direct;
-  uint8_t dataRatio[2];// 8B对齐
+  uint8_t dataRatio[2];// 8B对齐,不影响sizeof（struct ncclWorkElem）
 
   const void * sendbuff;
   void * recvbuff;

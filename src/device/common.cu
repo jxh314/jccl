@@ -8,6 +8,9 @@
 #include "collectives.h"
 #include "common.h"
 
+__device__ float blocksAlgbw[NCCL_MAX_NCHANNELS];
+__device__ float blocksTime[NCCL_MAX_NCHANNELS];
+
 __shared__ ncclShmemData ncclShmem;
 #if __CUDA_ARCH__ < 700
   __shared__ ulong2 ncclShmemPerWarp[ncclShmemScratchWarpSize()*(NCCL_MAX_NTHREADS/WARP_SIZE)/sizeof(ulong2)];
