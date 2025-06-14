@@ -11,6 +11,7 @@
 #include "device.h"
 #include "op128.h"
 #include "network/unpack/unpack_defs.h"
+#include <cstdio>
 
 #define COLL_UNROLL (ncclCollUnroll())
 
@@ -220,18 +221,17 @@ __device__ void ncclKernelMain(struct ncclDevComm* comm, uint64_t channelMask, s
       float time=result / 2520000; //ms
       uint8_t *ratio= workHead->elems[0].dataRatio;
       int totalRatio= ratio[0]+ ratio[1];
-      // 默认data type 为 float32 =4B，暂未结合实际数据类型
-      float totalBw= workHead->elems[0].count/ time *4 / 1.0E9*1000; 
-      // 2条channel 数据分配比例保存在elem中
+      int64_t channelCount;
       if(totalRatio> 0){
-        blocksAlgbw[channelId]= totalBw/ totalRatio* ratio[channelId%2];// 每条channel处理相应比例的数据量
+        // 2条不同的channel 数据分配比例保存在elem中, 默认data type 为 float32 =4B，暂未结合实际数据类型
+        channelCount= workHead->elems[0].count/ totalRatio* ratio[channelId%2];// 每条channel处理相应比例的数据量;
+        blocksAlgbw[channelId]= channelCount/ time *4/ 1.0E9* 1000; // GB/s
       }
       blocksTime[channelId]= time;
 
       if(comm->rank==0){
-         printf("rank %d blocks[%d] algbw %.3f GB/s, tid %d time %.2f totalCount %lu totalBw %.3f %d:(%d,%d)\n",
-              comm->rank, channelId, blocksAlgbw[channelId], tid, time, workHead->elems[0].count, 
-              totalBw, totalRatio, ratio[0], ratio[1]);
+         printf("rank %d blocks[%d] algbw %.3f GB/s, tid %d time %.2f channelCount/totalCount %lu/%lu dataRatio:(%d,%d)\n",
+              comm->rank, channelId, blocksAlgbw[channelId], tid, time, channelCount, workHead->elems[0].count, ratio[0], ratio[1]);
       }        
   }
 }
