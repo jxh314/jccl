@@ -221,17 +221,23 @@ __device__ void ncclKernelMain(struct ncclDevComm* comm, uint64_t channelMask, s
       float time=result / 2520000; //ms
       uint8_t *ratio= workHead->elems[0].dataRatio;
       int totalRatio= ratio[0]+ ratio[1];
+      int nChannels= workHead->elems[0].nChannels;
       int64_t channelCount;
       if(totalRatio> 0){
-        // 2条不同的channel 数据分配比例保存在elem中, 默认data type 为 float32 =4B，暂未结合实际数据类型
-        channelCount= workHead->elems[0].count/ totalRatio* ratio[channelId%2];// 每条channel处理相应比例的数据量;
+        if(nChannels==4){ // 仅针对4条channel的情况更改
+          // 2条不同的channel 数据分配比例保存在elem中, 默认data type 为 float32 =4B，暂未结合实际数据类型
+          channelCount= workHead->elems[0].count/ totalRatio* ratio[channelId%2];// 每条channel处理相应比例的数据量;
+        } else { // 默认平分
+          channelCount= workHead->elems[0].count/ nChannels;  
+        }
         blocksAlgbw[channelId]= channelCount/ time *4/ 1.0E9* 1000; // GB/s
       }
       blocksTime[channelId]= time;
 
       if(comm->rank==0){
          printf("rank %d blocks[%d] algbw %.3f GB/s, tid %d time %.2f channelCount/totalCount %lu/%lu dataRatio:(%d,%d)\n",
-              comm->rank, channelId, blocksAlgbw[channelId], tid, time, channelCount, workHead->elems[0].count, ratio[0], ratio[1]);
+              comm->rank, channelId, blocksAlgbw[channelId], tid, time, channelCount, 
+              workHead->elems[0].count, nChannels==4? ratio[0]:1, nChannels==4? ratio[1]:1);
       }        
   }
 }
