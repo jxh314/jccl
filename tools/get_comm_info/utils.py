@@ -8,7 +8,7 @@ import pattern
 def new_comm_group():
     return {
         'id': 0,
-        'type': '',
+        'name': '',
         'commId': '',
         'rank0_comm': '',
         'nranks': '',
@@ -65,17 +65,17 @@ def parse_nccl_log(log_content):
             # print(f"[nNodes_match] id={group['id']},rank0_comm={rank0_comm}, nNodes={nNodes}, localRanks={localRanks}, comm_id={comm_id}")
             continue
 
-        # 3.匹配 commType 行
-        commType_match = pattern.commType_pattern.search(line)
-        if commType_match:
-            rank0_comm = commType_match.group(1)
-            commTypeStr = commType_match.group(2)
+        # 3.匹配 commName 行
+        commName_match = pattern.commName_pattern.search(line)
+        if commName_match:
+            rank0_comm = commName_match.group(1)
+            commNameStr = commName_match.group(2)
             comm_id = next((cid for cid, r0c in commid_to_rank0comm.items() if r0c == rank0_comm), None)
             if comm_id is None:
                 continue
 
             group = status[comm_id]
-            group['type'] = commTypeStr
+            group['name'] = commNameStr
             continue
 
         # 4.匹配 nChannels 行
@@ -122,7 +122,7 @@ def parse_nccl_log(log_content):
 
 def print_status(status, base_name=None, aggregate=False):
     col_widths = {
-        "no": 4, "type":6,"commId": 20, "rank0 comm": 20, "nranks": 8, "nNodes": 8, "cudaDev": 8,"localRanks": 10,
+        "no": 4, "name":8,"commId": 20, "rank0 comm": 20, "nranks": 8, "nNodes": 8, "Dev": 4,"localRanks": 10,
         "nchannels": 10, "coll": 14, "msgsize/B": 14, "min_size": 12, "max_size": 12,
         "algo": 6, "proto": 8, "nc_used": 8, "count": 6
     }
@@ -153,12 +153,12 @@ def print_status(status, base_name=None, aggregate=False):
                 for (algo, proto, nc_used), info in agg.items():
                     rows.append({
                         "no": group['id'] if first_group else "",
-                        "type": group['type'] if first_group else "",
+                        "name": group['name'] if first_group else "",
                         "commId": comm_id if first_group else "",
                         "rank0 comm": group['rank0_comm'] if first_group else "",
                         "nranks": group['nranks'] if first_group else "",
                         "nNodes": group['nNodes'] if first_group else "",
-                        "cudaDev": group['cudaDev'] if first_group else "",
+                        "Dev": group['cudaDev'] if first_group else "",
                         "localRanks": group['localRanks'] if first_group else "",
                         "nchannels": group['nchannels'] if first_group else "",
                         "coll": coll,
@@ -176,12 +176,12 @@ def print_status(status, base_name=None, aggregate=False):
                     for entry in entry_list:
                         rows.append({
                             "no": group['id'] if first_group else "",# 只输出1次通信组基础信息
-                            "type": group['type'] if first_group else "",
+                            "name": group['name'] if first_group else "",
                             "commId": comm_id if first_group else "",
                             "rank0 comm": group['rank0_comm'] if first_group else "",
                             "nranks": group['nranks'] if first_group else "",
                             "nNodes": group['nNodes'] if first_group else "",
-                            "cudaDev": group['cudaDev'] if first_group else "",
+                            "Dev": group['cudaDev'] if first_group else "",
                             "localRanks": group['localRanks'] if first_group else "",
                             "nchannels": group['nchannels'] if first_group else "",
                             "coll": coll,

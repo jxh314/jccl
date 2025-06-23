@@ -1,10 +1,11 @@
 import re
 
-# 支持两种初始化格式
+# 支持3种初始化格式
 # NCCL INFO ncclCommInitRank comm 0x12026320 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 19000 commId 0xc266e719e89eb1ab - Init START
-# NCCL INFO ncclCommInitRankMemOpt comm 0x55a7a339db50 rank 0 nranks 8 cudaDev 0 nvmlDev 0 busId 4b000 commId 0x62a8e54c3929a7df - Init START
+# NCCL INFO ncclCommInitRankConfigMemOpt comm 0x55a7a339db50 rank 0 nranks 8 cudaDev 0 nvmlDev 0 busId 4b000 commId 0x62a8e54c3929a7df - Init START    
+# NCCL INFO ncclCommInitRankConfig
 initRank_start_pattern = re.compile(
-    r'.*?ncclCommInitRank(?:MemOpt)?(?:Config)? comm ([0-9a-fx]+) rank 0 nranks (\d+) cudaDev (\d+) .* commId ([0-9a-fx]+ - Init START)',
+    r'.*?ncclCommInitRank(?:Config)?(?:MemOpt)? comm ([0-9a-fx]+) rank 0 nranks (\d+) cudaDev (\d+) .* commId ([0-9a-fx]+ - Init START)',
     re.IGNORECASE
 )
 
@@ -14,9 +15,9 @@ nNodes_pattern = re.compile(
     re.IGNORECASE
 )
 
-# NCCL INFO comm 0x555e0a3036b0 rank 0 nranks 8 cudaDev 0 getCommBuffMemAlloc comm->commType 0 commTypeStr NCCL_TP_COMM_MEM_ALLOC
-commType_pattern = re.compile(
-    r'.*?NCCL INFO comm ([0-9a-fx]+) rank 0 nRanks \d+ cudaDev \d+ getCommBuffMemAlloc comm->commType \d+ commTypeStr NCCL_(.*?)_COMM_MEM_ALLOC',
+# NCCL INFO comm 0x555e0a3036b0 rank 0 nranks 8 cudaDev 0 setBuffSizesMemOpt commName paddleComm set LL BuffSize to 524288
+commName_pattern = re.compile(
+    r'NCCL INFO comm ([0-9a-fx]+) rank 0 nranks \d+ cudaDev \d+ setBuffSizesMemOpt commName (\w+) set LL BuffSize to (\d+)',
     re.IGNORECASE
 )
 

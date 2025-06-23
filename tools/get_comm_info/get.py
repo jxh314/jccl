@@ -44,8 +44,8 @@ def process_log_file(log_path, agg):
 def main():
     parser = argparse.ArgumentParser(description="NCCL通信组特征分析工具")
     parser.add_argument("-i", "--input", help="logfile path")
-    parser.add_argument("-d", "--dir", help="log目录，处理目录下所有.log文件")
-    parser.add_argument("-o", "--output", nargs='?', const='', help="可选，若不指定则为result.txt")
+    parser.add_argument("-d", "--dir", help="log目录,处理目录下所有.log文件")
+    parser.add_argument("-o", "--output", nargs='?', const='', help="可选,若不指定则为result.txt")
     parser.add_argument("-a", "--agg", action="store_true", help="是否聚合msgsize区间（algo/proto/nc_used相同则合并）")
     args = parser.parse_args()
 
