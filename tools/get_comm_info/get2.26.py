@@ -8,78 +8,55 @@ from tqdm import tqdm
 from collections import defaultdict
 from openpyxl import load_workbook
 
-######################## re pattern ########################################################################################
+######################################## re pattern #################################################
 
-# 支持两种初始化格式
-# ncclCommInitRank comm 0x1e7ae110 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 19000 commId 0x91b358bf33298e01 - Init COMPLETE
+# 支持3种初始化格式
+# NCCL INFO ncclCommInitRank comm 0x12026320 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 19000 commId 0xc266e719e89eb1ab - Init START
+# NCCL INFO ncclCommInitRankConfigMemOpt comm 0x55a7a339db50 rank 0 nranks 8 cudaDev 0 nvmlDev 0 busId 4b000 commId 0x62a8e54c3929a7df - Init START    
+# NCCL INFO ncclCommInitRankConfig
 initRank_start_pattern = re.compile(
-    r'.*?ncclCommInitRank(?:Config)? comm ([0-9a-fx]+) rank 0 nranks (\d+) cudaDev (\d+) .* commId ([0-9a-fx]+)',
+    r'.*?ncclCommInitRank(?:Config)?(?:MemOpt)? comm ([0-9a-fx]+) rank 0 nranks (\d+) cudaDev (\d+) .* commId ([0-9a-fx]+ - Init START)',
     re.IGNORECASE
 )
 
-#  NCCL INFO comm 0x18047360 rank 0 nRanks 32 nNodes 4 localRanks 8 localRank 0 MNNVL 0
+# NCCL INFO comm 0x55a7a339db50 rank 0 nRanks 8 nNodes 1 localRanks 8 localRank 0 MNNVL 0
 nNodes_pattern = re.compile(
     r'.*?NCCL INFO comm ([0-9a-fx]+) rank 0 nRanks (\d+) nNodes (\d+) localRanks (\d)+ localRank \d+ MNNVL \d+',
     re.IGNORECASE
 )
 
+# NCCL INFO comm 0x555e0a3036b0 rank 0 nranks 8 cudaDev 0 setBuffSizesMemOpt commName paddleComm set LL BuffSize to 524288
+commName_pattern = re.compile(
+    r'NCCL INFO comm ([0-9a-fx]+) rank 0 nranks \d+ cudaDev \d+ setBuffSizesMemOpt commName (\w+) set LL BuffSize to (\d+)',
+    re.IGNORECASE
+)
+
 # NCCL INFO comm 0x55a7a339db50, 16 coll channels, 16 collnet channels, 0 nvls channels, 16 p2p channels, 2 p2p channels per peer
-# NCCL INFO 24 coll channels, 24 collnet channels, 0 nvls channels, 32 p2p channels, 32 p2p channels per peer
 nChannels_pattern = re.compile(
     r'.*?NCCL INFO comm ([0-9a-fx]+), (\d+) coll channels, (\d+) collnet channels, (\d+) nvls channels, (\d+) p2p channels, (\d+) p2p channels per peer',
     re.IGNORECASE
 )
 
-# NCCL INFO Broadcast: opCount 0 sendbuff 0x7f5b6dec9900 recvbuff 0x7f5b6dec9900 count 8 datatype 0 op 0 root 0 comm 0x1e7ae110 [nranks=2] stream 0x1df54ef0
-# NCCL INFO Send: opCount 782f sendbuff (nil) recvbuff 0x7f59a1a8fa00 count 2097152 datatype 9 op 0 root 3 comm 0x18076b90 [nranks=4] stream 0xb617630
-sendrecv_addr_pattern = r'(?:[0-9a-fx]+|\(nil\))'
-coll_pattern = re.compile(
-    rf'.*?NCCL INFO (AllReduce|Broadcast|Reduce|AllGather|ReduceScatter|Send|Recv): opCount ([0-9a-fA-Fx]+) '
-    rf'sendbuff {sendrecv_addr_pattern} recvbuff {sendrecv_addr_pattern} count (\d+) '
-    r'datatype (\d)+ op \d+ root \d+ comm ([0-9a-fx]+) \[nranks=(\d+)\]'
-)
+# NCCL INFO Init timings - ncclCommInitRankMemOpt: rank 0 nranks 8 total 0.48 (kernels 0.13, alloc 0.19, bootstrap 0.00, allgathers 0.01, topo 0.11, graphs 0.00, connections 0.04, rest 0.00)
 
-# NCCL INFO 8 Bytes -> Algo 1 proto 0 time 7.200057
+
+# INFO(NCCL_TUNING, "%s: %ld Bytes -> Algo %s proto %s channel{Lo..Hi}={%d..%d} comm %p"
 tuning_pattern = re.compile(
-   r'.*?NCCL INFO (\d+) Bytes -> Algo (\d+) proto (\d+)'
+   r'.*?NCCL INFO (AllReduce|Broadcast|Reduce|AllGather|ReduceScatter|Send|Recv): (\d+) Bytes -> Algo (\w+) proto (\w+) channel\{Lo\.\.Hi\}=\{(\d+)\.\.(\d+)\} comm ([0-9a-fx]+)'
 )
-
-datatype_bytes = {
-    0: 1,   # ncclInt8 / ncclChar
-    1: 1,   # ncclUint8
-    2: 4,   # ncclInt32 / ncclInt
-    3: 4,   # ncclUint32
-    4: 8,   # ncclInt64
-    5: 8,   # ncclUint64
-    6: 2,   # ncclFloat16 / ncclHalf
-    7: 4,   # ncclFloat32 / ncclFloat
-    8: 8,   # ncclFloat64 / ncclDouble
-    9: 2    # ncclBfloat16
-}
-
-#define NCCL_NUM_ALGORITHMS 6 // Tree/Ring/CollNet*
-#define NCCL_ALGO_UNDEF -1
-#define NCCL_ALGO_TREE 0
-#define NCCL_ALGO_RING 1
-#define NCCL_ALGO_COLLNET_DIRECT 2
-#define NCCL_ALGO_COLLNET_CHAIN 3
-#define NCCL_ALGO_NVLS 4
-#define NCCL_ALGO_NVLS_TREE 5
-algo_map = {'0': 'TREE', '1': 'RING', '2': 'COLLNET_DIRECT', '3': 'COLLNET_CHAIN', '4': 'NVLS', '5': 'NVLS_TREE'}
-proto_map = {'0': 'LL', '1': 'LL128', '2': 'SIMPLE'}
 
 def new_comm_group():
     return {
         'id': 0,
-        'name': 'paddle',
+        'name': '',
         'commId': '',
         'rank0_comm': '',
         'nranks': '',
-        'nNodes': '',
+        'nNodes': 0,
         'cudaDev': '',
-        'localRanks': '',
-        'nchannels': '',
-        'initTime': '',
+        'localRanks': 0,
+        'nchannels': 0,
+        'initTime': 0,
         # colls[coll][msgsize] = [ {algo, proto, nc_used, count}, ... ]
         'colls': defaultdict(lambda: defaultdict(list))
     }
@@ -88,12 +65,10 @@ def parse_nccl_log(log_content):
     status = defaultdict(new_comm_group)
     commid_to_rank0comm = {}  # commId -> rank0_comm
 
-    pending_coll_info = None
-
     lines = log_content.strip().split("\n")
-    for line in tqdm(lines, desc="Parsing", ncols=80):
+    for line in tqdm(lines, desc="log parsing", ncols=80):
         line = line.strip()
-        
+    
         # 1.匹配通信组初始化行
         init_match = initRank_start_pattern.search(line)
         if init_match:
@@ -105,11 +80,11 @@ def parse_nccl_log(log_content):
 
             group = status[comm_id]
             group['id'] = len(status)
+            group['name'] = '-'
             group['commId'] = comm_id
             group['rank0_comm'] = rank0_comm
             group['nranks'] = nranks
             group['cudaDev'] = cudaDev #此处仅为rank 0的cudaDev,后续需要补全，这个通信组的所有rank的cudaDev
-            group['nchannels'] = -1
             continue
 
         # 2.匹配 nNodes 行
@@ -130,7 +105,20 @@ def parse_nccl_log(log_content):
             # print(f"[nNodes_match] id={group['id']},rank0_comm={rank0_comm}, nNodes={nNodes}, localRanks={localRanks}, comm_id={comm_id}")
             continue
 
-        # 3.匹配 nChannels 行
+        # 3.匹配 commName 行
+        commName_match = commName_pattern.search(line)
+        if commName_match:
+            rank0_comm = commName_match.group(1)
+            commNameStr = commName_match.group(2)
+            comm_id = next((cid for cid, r0c in commid_to_rank0comm.items() if r0c == rank0_comm), None)
+            if comm_id is None:
+                continue
+
+            group = status[comm_id]
+            group['name'] = commNameStr
+            continue
+
+        # 4.匹配 nChannels 行
         nc_match= nChannels_pattern.search(line)
         if(nc_match):
             rank0_comm = nc_match.group(1)
@@ -144,58 +132,19 @@ def parse_nccl_log(log_content):
             # print(f"[nChannels_match] id={group['id']},rank0_comm={rank0_comm}, nc={nc}, comm_id={comm_id}")
             continue
 
-        # 4.先匹配coll行，缓存操作信息
-        op_match = coll_pattern.search(line)
-        if op_match:
-            coll = op_match.group(1)
-            # opCount = op_match.group(2)
-            count = int(op_match.group(3))
-            datatype= int(op_match.group(4))
-            rank0_comm = op_match.group(5)
-            nranks = int(op_match.group(6))
-
-            comm_id = next((cid for cid, r0c in commid_to_rank0comm.items() if r0c == rank0_comm), None)
-            if comm_id is None:
-                continue
-            group = status[comm_id]
-
-            if coll in ("Send", "Recv"): # 针对Send/Recv直接统计
-                bytes_per_elem = datatype_bytes.get(datatype, 1)
-                msgsize = count * bytes_per_elem
-                entry_list = group['colls'][coll][msgsize]
-                # 查找是否已有该msgsize的统计项
-                entry = next((e for e in entry_list if e['algo'] == '-' and e['proto'] == '-' and e['nc_used'] == -1), None)
-                if entry:
-                    entry['count'] += 1
-                else:
-                    entry_list.append({'algo': '-', 'proto': '-', 'nc_used': -1, 'count': 1})
-            else: # 其他coll操作，缓存操作信息,后续再匹配tuning行
-                pending_coll_info = {
-                    'coll': coll,
-                    'count': count,
-                    'rank0_comm': rank0_comm,
-                    'nranks': nranks
-                }
-            continue
-        
-        # 5.再匹配tuning行，补全算法/协议/通道等信息
+        # 5.匹配tuning行，获取算法/协议/通道等信息
         tuning_match = tuning_pattern.search(line)
-        if tuning_match and pending_coll_info:
-            # coll=tuning_match.group(1)
-            msgsize = int(tuning_match.group(1))
-            algo = tuning_match.group(2)
-            proto = tuning_match.group(3) 
-            algo = algo_map.get(algo, algo)
-            proto = proto_map.get(proto, proto)
-            # channel_lo = int(tuning_match.group(5))
-            # channel_hi = int(tuning_match.group(6))
-            nc_used = -1
-
-            # 用pending_coll_info补全
-            rank0_comm = pending_coll_info['rank0_comm']
-            if coll != pending_coll_info['coll']:
-                print(f"Warning: coll mismatch! {coll} != {pending_coll_info['coll']}")
-                continue
+        if tuning_match:
+            coll=tuning_match.group(1)
+            msgsize = int(tuning_match.group(2))
+            algo = tuning_match.group(3)
+            proto = tuning_match.group(4)
+            channel_lo = int(tuning_match.group(5))
+            channel_hi = int(tuning_match.group(6))
+            rank0_comm = tuning_match.group(7)
+            nc_used = channel_hi - channel_lo + 1
+            if algo == 'Unknown':
+                algo = '-'
 
             comm_id = next((cid for cid, r0c in commid_to_rank0comm.items() if r0c == rank0_comm), None)
             if comm_id is None:
@@ -210,13 +159,11 @@ def parse_nccl_log(log_content):
             else:
                 entry_list.append({'algo': algo, 'proto': proto, 'nc_used': nc_used, 'count': 1})
 
-            pending_coll_info = None # 清空缓存
-
     return status
 
 def print_status(status, base_name=None, aggregate=False):
     col_widths = {
-        "no": 4, "name":10,"commId": 20, "rank0 comm": 20, "nranks": 8, "nNodes": 8, "Dev": 4,"localRanks": 10,
+        "no": 4, "name":14, "commId": 20, "rank0 comm": 20, "nranks": 8, "nNodes": 8, "Dev": 4,"localRanks": 10,
         "nchannels": 10, "coll": 14, "msgsize/B": 14, "min_size": 12, "max_size": 12,
         "algo": 6, "proto": 8, "nc_used": 8, "count": 6
     }

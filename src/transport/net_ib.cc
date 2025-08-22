@@ -1255,6 +1255,7 @@ ib_recv_dev_list:
   mergedDev = ncclIbMergedDevs + dev;
   comm->base.vProps = mergedDev->vProps;
   int localNqps, remoteNqps;
+  // 这里应该是每条channel 的 send comm 用的qps, 一般 ndevs = 1，只用了1个网卡发
   localNqps  = ncclParamIbQpsPerConn() * comm->base.vProps.ndevs; // We must have at least 1 qp per-device
   remoteNqps = ncclParamIbQpsPerConn() * remoteVProps.ndevs;
   comm->base.nqps = remoteNqps > localNqps ? remoteNqps : localNqps; // Select max nqps (local or remote)
@@ -1271,6 +1272,7 @@ ib_recv_dev_list:
   memset(&meta, 0, sizeof(meta));
   meta.ndevs = comm->base.vProps.ndevs;
 
+  // 为当前 channel（send comm）的dev分配 QP
   // Alternate QPs between devices
   int devIndex;
   devIndex = 0;
@@ -1426,6 +1428,8 @@ ib_connect:
     }
   }
 
+  // nqps：本地和远端qps的最大值（用于 split 模式）
+  // nDataQps：本地和远端设备数的最大值，用于 round-robin 模式下 QP 轮转。
   comm->base.nDataQps = std::max(comm->base.vProps.ndevs, comm->base.nRemDevs);
 
   comm->base.ready = 1;
@@ -1905,14 +1909,15 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, void* pHandl
   if (nreqs > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
 
   uint64_t wr_id = 0ULL;
-  for (int r=0; r<nreqs; r++) {
-    struct ibv_send_wr* wr = comm->wrs+r;
+  for (int r = 0; r < nreqs; r++) {
+    struct ibv_send_wr* wr = comm->wrs + r;
     memset(wr, 0, sizeof(struct ibv_send_wr));
 
-    struct ibv_sge* sge = comm->sges+r;
-    sge->addr=(uintptr_t)reqs[r]->send.data;
+    struct ibv_sge* sge = comm->sges + r;
+    sge->addr = (uintptr_t)reqs[r]->send.data;
     wr->opcode = IBV_WR_RDMA_WRITE;
     wr->send_flags = 0;
+    // recv 端的 addr 已经被写入 slots
     wr->wr.rdma.remote_addr = slots[r].addr;
     wr->next = wr + 1;
     wr_id += (reqs[r] - comm->base.reqs) << (r*8);
@@ -1921,31 +1926,45 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, void* pHandl
 #endif
   }
 
+  // 将数据大小通过 immediate 字段传递。如果是多次发送（multi-send），
+  // 则只写入 0 或 1 作为大小，用于指示本次是否有数据被发送或接收。
   // Write size as immediate data. In the case of multi-send, only write
   // 0 or 1 as size to indicate whether there was data sent or received.
   uint32_t immData = 0;
   if (nreqs == 1) {
+    // 单次发送：用 immediate 数据直接传递 size。
     immData = reqs[0]->send.size;
   } else {
+    // 多次发送：用 sizes FIFO 传递每个分片的 size，作为 WR 的 SGE 一起写到对端。
+    /* 将每个分片的实际大小写入sizes 数组（即 sizes FIFO）。comm->remSizesFifo.sge.addr 和 
+    length 分别指向这块内存和其长度，后续会作为WR 的 SGE（scatter-gather entry）用于 RDMA write。
+    这样，发送端会把所有分片的大小信息写到对端的 sizes FIFO，接收端可以逐个读取每个分片的实际大小。*/
     int* sizes = comm->remSizesFifo.elems[slot];
     for (int r=0; r<nreqs; r++) sizes[r] = reqs[r]->send.size;
     comm->remSizesFifo.sge.addr = (uint64_t)sizes;
     comm->remSizesFifo.sge.length = nreqs*sizeof(int);
   }
 
-  struct ibv_send_wr* lastWr = comm->wrs+nreqs-1;
+  struct ibv_send_wr* lastWr = comm->wrs + nreqs - 1;
+  // AR 场景下不能将数据和 imm_data 合并到一个rdma write with imm的wr中，因为imm类型不支持报文级别的选路，不支持Ar
+  // only write and read supports AR
+  // nreqs >1也需要发一个 lastwr 的原因，可能对应多QP，选路不同，也需要等待所有wr 到达？？？
   if (nreqs > 1 || (comm->ar && reqs[0]->send.size > ncclParamIbArThreshold())) {
     // When using ADAPTIVE_ROUTING, send the bulk of the data first as an
     // RDMA_WRITE, then a 0-byte RDMA_WRITE_WITH_IMM to trigger a remote completion.
+    // 先以 RDMA_WRITE 发送主体数据，随后发送一个 0 字节的 RDMA_WRITE_WITH_IMM 来触发远程完成事件
 
     // This is needed to ensure that the remote side can read the sizes from the sizesFifo before the next send.
     // If not using AR, we can just send the sizes in the last WR.
     lastWr++;
     memset(lastWr, 0, sizeof(struct ibv_send_wr));
     if (nreqs > 1) {
+      // sizes FIFO 就是一个用于存放“每个消息实际大小”的队列，位于远端内存。
       // Write remote sizes Fifo
-      lastWr->wr.rdma.remote_addr = comm->remSizesFifo.addr + slot*NCCL_NET_IB_MAX_RECVS*sizeof(int);
-      lastWr->num_sge = 1;
+      lastWr->wr.rdma.remote_addr = comm->remSizesFifo.addr + slot * NCCL_NET_IB_MAX_RECVS * sizeof(int);
+      lastWr->num_sge = 1;// 若不满足nreqs > 1, 仅开启ar不需要发sge, 仅发imm data
+      // 0字节 指的是这条WR 实际不写任何数据内容，即 SGE（scatter-gather entry）长度为0，或者 num_sge=0。
+      // 但你也可以让它写一点点数据（比如写入 sizes FIFO），这时它既写了数据，又带了 immediate。
       lastWr->sg_list = &comm->remSizesFifo.sge;
     }
   }
@@ -1957,7 +1976,8 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, void* pHandl
 
   // Multi-QP: make sure IB writes are multiples of 128B so that LL and LL128 protocols still work
   const int align = 128;
-  // 这俩的区别？comm->base.nqps : comm->base.nDataQps
+  // nqps：本地和远端qps的最大值（用于 split 模式）
+  // nDataQps：本地和远端设备数的最大值，用于 round-robin 模式下 QP 轮转。
   int nqps = ncclParamIbSplitDataOnQps() ? comm->base.nqps : comm->base.nDataQps;
   for (int i = 0; i < nqps; i++) {
     int qpIndex = comm->base.qpIndex;
@@ -2018,6 +2038,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, void* pHandl
       comm->wrs[r].wr.rdma.remote_addr += chunkSize;
     }
 
+    // 转起来
     // Select the next qpIndex
     comm->base.qpIndex = (comm->base.qpIndex+1) % comm->base.nqps;
   }
@@ -2034,6 +2055,8 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
   struct ncclIbMrHandle* mhandleWrapper = (struct ncclIbMrHandle*) mhandle;
 
   // Wait for the receiver to have posted the corresponding receive
+  // 发送端（sender）在发起 RDMA 操作前，需要确保接收端（receiver）已经准备好，
+  // 即已经 post 了对应的 receive，并把相关信息（如 buffer 地址、rkey、size 等）写入了 FIFO 槽（slot）。
   int nreqs = 0;
   volatile struct ncclIbSendFifo* slots;
 
@@ -2041,9 +2064,23 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
   slots = comm->fifo[slot];
   uint64_t idx = comm->fifoHead+1;
+  // slots[0].idx：用于判断主槽（主请求）是否准备好。
   if (slots[0].idx != idx) { *request = NULL; return ncclSuccess; }
   nreqs = slots[0].nreqs;
   // Wait until all data has arrived
+  // 发送端会不断检查（轮询）slots[r].idx 是否等于 comm->fifoHead+1。
+  // 只有当所有相关的 slots[r].idx 都等于目标值时，才说明接收端已经全部准备好
+  // slots[r].idx（r=1~nreqs-1）：用于判断所有子请求是否都准备好。
+  /*
+  [接收端] post receive
+   |
+   |---> 在 FIFO slot 写入 idx = comm->fifoHead+1, nreqs, tag, size, addr, rkeys...
+   |
+  [发送端] 轮询 FIFO slot
+   |
+   |---> 发现 idx == comm->fifoHead+1，说明接收端已准备好
+   |---> 读取 slot 里的信息，发起 RDMA write
+  */
   for (int r=1; r<nreqs; r++) while(slots[r].idx != idx);
   __sync_synchronize(); // order the nreqsPtr load against tag/rkey/addr loads below
   for (int r=0; r<nreqs; r++) {
@@ -2092,6 +2129,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
 
     *request = reqs[r] = req;
 
+    // 如果是 multi-recv，需等所有请求都匹配后再发送
     // If this is a multi-recv, send only when all requests have matched.
     for (int r=0; r<nreqs; r++) {
       if (reqs[r] == NULL) return ncclSuccess;
@@ -2100,6 +2138,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
     TIME_START(0);
     NCCLCHECK(ncclIbMultiSend(comm, slot, phandle));
 
+    // 清理 FIFO 槽，便于调试和后续复用
     // Clear slots[0]->nreqs, as well as other fields to help debugging and sanity checks
     memset((void*)slots, 0, sizeof(struct ncclIbSendFifo));
     memset(reqs, 0, NCCL_NET_IB_MAX_RECVS*sizeof(struct ncclIbRequest*));
@@ -2341,12 +2380,13 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
       TIME_START(3);
       // If we expect any completions from this device's CQ
       if (r->events[i]) {
+        // 这里 poll cq ，获取 ibv_wc（work completion）
         NCCLCHECK(wrap_ibv_poll_cq(r->devBases[i]->cq, 4, wcs, &wrDone));
         totalWrDone += wrDone;
         if (wrDone == 0) { TIME_CANCEL(3); } else { TIME_STOP(3); }
         if (wrDone == 0) continue;
-        for (int w=0; w<wrDone; w++) {
-          struct ibv_wc *wc = wcs+w;
+        for (int w = 0; w < wrDone; w++) {
+          struct ibv_wc *wc = wcs + w;
           if (wc->status != IBV_WC_SUCCESS) {
             union ncclSocketAddress addr;
             ncclSocketGetAddr(r->sock, &addr);
@@ -2395,6 +2435,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
                 return ncclInternalError;
               }
               if (req->nreqs == 1) {
+                // 这里imm_data被存入
                 req->recv.sizes[0] = wc->imm_data;
               }
             }

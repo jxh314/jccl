@@ -122,7 +122,7 @@ def parse_nccl_log(log_content):
 
 def print_status(status, base_name=None, aggregate=False):
     col_widths = {
-        "no": 4, "name":8,"commId": 20, "rank0 comm": 20, "nranks": 8, "nNodes": 8, "Dev": 4,"localRanks": 10,
+        "no": 4, "name":14, "commId": 20, "rank0 comm": 20, "nranks": 8, "nNodes": 8, "Dev": 4,"localRanks": 10,
         "nchannels": 10, "coll": 14, "msgsize/B": 14, "min_size": 12, "max_size": 12,
         "algo": 6, "proto": 8, "nc_used": 8, "count": 6
     }
